@@ -67,7 +67,7 @@ class CertificateGenerationTests(unittest.TestCase):
             "applications.json",
             {
                 "e1": {
-                    "volunteer": {"status": "accepted"},
+                    "volunteer": {"status": "accepted", "role": "Sound Crew"},
                 }
             },
         )
@@ -124,7 +124,7 @@ class CertificateGenerationTests(unittest.TestCase):
         issue_date = issue_date.replace(" 0", " ")
 
         self.assertTrue(pdf.startswith(b"%PDF-1.4"))
-        self.assertIn(b"/MediaBox [0 0 792 612]", pdf)
+        self.assertRegex(pdf, rb"/MediaBox\s*\[\s*0\s+0\s+792\s+612\s*\]")
         self.assertIn(b"/Count 1", pdf)
         self.assertFalse((self.root / "data" / "certificates").exists())
         for expected in (
@@ -132,6 +132,8 @@ class CertificateGenerationTests(unittest.TestCase):
             b"PARTICIPATION",
             b"Amelia Johnson",
             b"Community Food Drive",
+            b"as Sound Crew",
+            b"Organizer One",
             b"Event date: October 6, 2025",
             f"Issue date: {issue_date}".encode(),
             b"3 volunteer hours",
@@ -139,16 +141,42 @@ class CertificateGenerationTests(unittest.TestCase):
             b"Verify at /verify",
             b"Event Organizer Signature",
             b"/Subtype /Image",
-            b"/Filter /DCTDecode",
-            b"/Dome Do",
-            b"/Dome 9 0 R",
-            b"/BaseFont /Times-Roman",
-            b"/BaseFont /Times-Bold",
-            b"W n",
+            b"/DCTDecode",
+            b"/XObject",
+            b"/FontFile2",
+            b"Fraunces",
+            b"DMSans",
+            b"W* n",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, pdf)
         self.assertNotIn(record["verification_code"].encode(), pdf)
+
+    def test_certificate_capitalization_brand_fonts_and_optional_role(self):
+        users = data_store.load("users.json")
+        users["volunteer"]["name"] = "aMELia jOHNSON"
+        data_store.save("users.json", users)
+        events = data_store.load("events.json")
+        events["e1"]["name"] = "community food drive"
+        data_store.save("events.json", events)
+
+        record, pdf = self.issue_directly()
+        self.assertIn(b"Amelia Johnson", pdf)
+        self.assertIn(b"Community Food Drive", pdf)
+        self.assertIn(b"as Sound Crew", pdf)
+        self.assertIn(b"Organizer One", pdf)
+        self.assertIn(b"/FontFile2", pdf)
+        self.assertEqual(
+            certificate_service._event_display_name("hACKathon Service"),
+            "hACKathon Service",
+        )
+
+        applications = data_store.load("applications.json")
+        applications["e1"]["volunteer"]["role"] = None
+        data_store.save("applications.json", applications)
+        record["volunteer_role"] = None
+        roleless_pdf = certificate_service.render_certificate_pdf(record)
+        self.assertNotIn(b"as Sound Crew", roleless_pdf)
 
     def test_decimal_contribution_hours_are_saved_verified_and_included_in_pdf(self):
         self.sign_in("organizer")
@@ -207,7 +235,7 @@ class CertificateGenerationTests(unittest.TestCase):
         )
         self.assertIn(b"Amelia Alexandria Johnson", pdf)
         self.assertIn(b"Community Food and Supply Drive", pdf)
-        self.assertIn(b"/MediaBox [0 0 792 612]", pdf)
+        self.assertRegex(pdf, rb"/MediaBox\s*\[\s*0\s+0\s+792\s+612\s*\]")
         self.assertIn(b"/Count 1", pdf)
 
     def test_public_verification_normalizes_code_and_shows_dates(self):

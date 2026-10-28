@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
+from io import BytesIO
 import math
 from pathlib import Path
 import re
@@ -12,12 +13,24 @@ from typing import Any
 from data_store import load, save
 from formatting import format_decimal
 from notification_service import add_notifications
+from reportlab.lib.colors import Color, HexColor
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen.canvas import Canvas
 
 
 EVENTS_FILE = "events.json"
 APPLICATIONS_FILE = "applications.json"
 USERS_FILE = "users.json"
 CERTIFICATES_FILE = "certificates.json"
+CERTIFICATE_FONT_FILES = {
+    "DM-Sans": Path(__file__).resolve().parent / "static" / "fonts" / "dm-sans" / "DM-Sans-Regular.ttf",
+    "DM-Sans-Bold": Path(__file__).resolve().parent / "static" / "fonts" / "dm-sans" / "DM-Sans-Bold.ttf",
+    "Fraunces-SemiBold": Path(__file__).resolve().parent / "static" / "fonts" / "fraunces" / "Fraunces-SemiBold.ttf",
+    "Fraunces-Bold": Path(__file__).resolve().parent / "static" / "fonts" / "fraunces" / "Fraunces-Bold.ttf",
+}
+_CERTIFICATE_FONTS_REGISTERED = False
 
 
 def _load_object(filename: str, description: str) -> dict[str, Any]:
@@ -27,11 +40,18 @@ def _load_object(filename: str, description: str) -> dict[str, Any]:
     return data
 
 
-def _safe_pdf_text(value: Any) -> str:
-    """Make user-provided text safe for a basic Helvetica PDF content stream."""
-    text = " ".join(str(value).split())
-    text = text.encode("cp1252", errors="replace").decode("cp1252")
-    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+def _register_certificate_fonts() -> None:
+    """Register the local static instances of the site's DM Sans and Fraunces fonts."""
+    global _CERTIFICATE_FONTS_REGISTERED
+    if _CERTIFICATE_FONTS_REGISTERED:
+        return
+    registered_fonts = set(pdfmetrics.getRegisteredFontNames())
+    for font_name, font_path in CERTIFICATE_FONT_FILES.items():
+        if not font_path.is_file():
+            raise FileNotFoundError(f"Required certificate font is missing: {font_path}")
+        if font_name not in registered_fonts:
+            pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+    _CERTIFICATE_FONTS_REGISTERED = True
 
 
 def _parse_certificate_date(value: Any) -> date | None:
@@ -125,37 +145,41 @@ def _normalize_verification_code(value: Any) -> str | None:
     return normalized if re.fullmatch(r"[A-Z0-9]{10}", normalized) else None
 
 
-def _estimated_text_width(text: str, font_size: int, bold: bool = False) -> float:
-    """Conservatively estimate Helvetica text width for line wrapping and centering."""
-    width = 0.0
-    for character in text:
-        if character in " ilI.,:;!|'`":
-            factor = 0.29
-        elif character in "MW@%&":
-            factor = 0.86
-        elif character in "frt()[]":
-            factor = 0.36
-        elif character.isupper():
-            factor = 0.66
-        else:
-            factor = 0.54
-        width += factor * font_size * (1.05 if bold else 1)
-    return width
+def _estimated_text_width(
+    text: str,
+    font_size: int,
+    bold: bool = False,
+    font_name: str | None = None,
+) -> float:
+    """Measure text using the registered font that will be embedded in the PDF."""
+    _register_certificate_fonts()
+    selected_font = font_name or (
+        "Fraunces-Bold" if bold else "Fraunces-SemiBold"
+    )
+    return pdfmetrics.stringWidth(" ".join(str(text).split()), selected_font, font_size)
 
 
-def _wrap_pdf_text(text: Any, max_width: float, font_size: int, bold: bool) -> list[str]:
+def _wrap_pdf_text(
+    text: Any,
+    max_width: float,
+    font_size: int,
+    bold: bool,
+    font_name: str | None = None,
+) -> list[str]:
     normalized = " ".join(str(text).split())
     if not normalized:
         return [""]
 
     tokens: list[str] = []
     for word in normalized.split(" "):
-        if _estimated_text_width(word, font_size, bold) <= max_width:
+        if _estimated_text_width(word, font_size, bold, font_name) <= max_width:
             tokens.append(word)
             continue
         chunk = ""
         for character in word:
-            if chunk and _estimated_text_width(chunk + character, font_size, bold) > max_width:
+            if chunk and _estimated_text_width(
+                chunk + character, font_size, bold, font_name
+            ) > max_width:
                 tokens.append(chunk)
                 chunk = character
             else:
@@ -167,7 +191,9 @@ def _wrap_pdf_text(text: Any, max_width: float, font_size: int, bold: bool) -> l
     current = ""
     for token in tokens:
         candidate = f"{current} {token}".strip()
-        if current and _estimated_text_width(candidate, font_size, bold) > max_width:
+        if current and _estimated_text_width(
+            candidate, font_size, bold, font_name
+        ) > max_width:
             lines.append(current)
             current = token
         else:
@@ -184,41 +210,50 @@ def _fit_pdf_text(
     minimum_size: int,
     max_lines: int,
     bold: bool = False,
+    font_name: str | None = None,
 ) -> tuple[list[str], int]:
     for font_size in range(preferred_size, minimum_size - 1, -1):
-        lines = _wrap_pdf_text(text, max_width, font_size, bold)
+        lines = _wrap_pdf_text(text, max_width, font_size, bold, font_name)
         if len(lines) <= max_lines:
             return lines, font_size
 
     font_size = minimum_size
-    lines = _wrap_pdf_text(text, max_width, font_size, bold)[:max_lines]
+    lines = _wrap_pdf_text(text, max_width, font_size, bold, font_name)[:max_lines]
     if lines:
         suffix = "..."
         last_line = lines[-1]
-        while last_line and _estimated_text_width(last_line + suffix, font_size, bold) > max_width:
+        while last_line and _estimated_text_width(
+            last_line + suffix, font_size, bold, font_name
+        ) > max_width:
             last_line = last_line[:-1].rstrip()
         lines[-1] = last_line + suffix
     return lines, font_size
 
 
-def _pdf_text_command(
+def _draw_certificate_text(
+    canvas: Canvas,
     text: Any,
     x: float,
     y: float,
     font_size: int,
-    font: str,
-    color: tuple[float, float, float],
-    centered: bool = False,
-) -> str:
+    font_name: str,
+    color: Color,
+) -> None:
     normalized = " ".join(str(text).split())
-    if centered:
-        x -= _estimated_text_width(normalized, font_size, font in ("F2", "F4")) / 2
-    red, green, blue = color
-    return (
-        f"{red:.3f} {green:.3f} {blue:.3f} rg "
-        f"BT /{font} {font_size} Tf 1 0 0 1 {x:.2f} {y:.2f} Tm "
-        f"({_safe_pdf_text(normalized)}) Tj ET"
-    )
+    canvas.setFillColor(color)
+    canvas.setFont(font_name, font_size)
+    canvas.drawCentredString(x, y, normalized)
+
+
+def _volunteer_display_name(value: Any) -> str:
+    """Use the requested Title Case presentation without changing stored profile data."""
+    return " ".join(str(value).split()).title()
+
+
+def _event_display_name(value: Any) -> str:
+    """Title-case event names only when every cased character was entered lowercase."""
+    normalized = " ".join(str(value).split())
+    return normalized.title() if normalized.islower() else normalized
 
 
 def _render_certificate_pdf(
@@ -227,165 +262,324 @@ def _render_certificate_pdf(
     hours: int | float,
     event_date: str | None = None,
     issue_date: str | None = None,
+    volunteer_role: str | None = None,
+    organizer_name: str | None = None,
 ) -> bytes:
     """Render a single-page landscape certificate with a split photo-and-type layout."""
-    dark_green = (0.08, 0.31, 0.25)
-    muted_green = (0.20, 0.43, 0.36)
-    gold = (0.78, 0.58, 0.23)
-    paper = (0.976, 0.965, 0.929)
-    ink = (0.12, 0.16, 0.20)
-    muted_ink = (0.34, 0.38, 0.40)
+    _register_certificate_fonts()
+    navy = HexColor("#17243b")
+    accent = HexColor("#D4B483")
+    paper = Color(0.976, 0.965, 0.929)
+    muted_ink = HexColor("#48566b")
     dome_jpeg, dome_width, dome_height = _read_dome_image()
     image_scale = 558 / dome_height
     image_width = dome_width * image_scale
     image_height = dome_height * image_scale
     image_x = 27 - 315 * image_scale
     image_y = 27
-    commands = [
-        f"{paper[0]:.3f} {paper[1]:.3f} {paper[2]:.3f} rg 0 0 792 612 re f",
-        "q",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG "
-        "0.9 w 18 18 756 576 re S 25 25 742 562 re S",
-        "Q",
-        "q 27 27 m 27 585 l 350 585 l "
-        "369 548 380 495 381 430 c "
-        "383 352 380 280 371 210 c "
-        "361 140 347 75 337 27 c 27 27 l h W n",
-        f"q {image_width:.2f} 0 0 {image_height:.2f} "
-        f"{image_x:.2f} {image_y:.2f} cm /Dome Do Q",
-        "Q",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG "
-        "1.5 w 27 585 m 350 585 l "
-        "369 548 380 495 381 430 c "
-        "383 352 380 280 371 210 c "
-        "361 140 347 75 337 27 c 27 27 l S",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG "
-        "0.55 w 346 582 m 365 545 375 490 377 427 c "
-        "379 352 376 280 367 210 c "
-        "358 140 344 75 333 30 c S",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} rg "
-        "576 532 m 581 537 l 586 532 l 581 527 l h f",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG 0.9 w "
-        "448 534 m 510 534 l S 652 534 m 714 534 l S",
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG 0.75 w "
-        "366 29 m 380 55 390 100 414 151 c S "
-        "371 47 m 362 45 357 49 354 55 c 362 59 369 56 371 47 c S "
-        "378 64 m 388 57 396 58 400 63 c 394 70 386 70 378 64 c S "
-        "382 81 m 372 77 365 81 363 87 c 371 92 378 89 382 81 c S "
-        "388 98 m 398 90 407 91 411 96 c 404 103 396 104 388 98 c S "
-        "394 116 m 384 112 377 116 375 122 c 383 127 390 124 394 116 c S "
-        "401 134 m 411 126 419 128 422 133 c 415 140 407 140 401 134 c S",
-    ]
-    commands.extend((
-        _pdf_text_command(
-            "MIT WORLD PEACE UNIVERSITY", 581, 566, 10, "F2", dark_green, centered=True,
-        ),
-        _pdf_text_command("PUNE", 581, 551, 7, "F2", muted_green, centered=True),
-        _pdf_text_command(
-            "CERTIFICATE OF", 581, 501, 20, "F3", dark_green, centered=True,
-        ),
-        _pdf_text_command(
-            "PARTICIPATION", 581, 472, 29, "F4", dark_green, centered=True,
-        ),
-        _pdf_text_command(
-            "PRESENTED TO", 581, 438, 8, "F2", muted_green, centered=True,
-        ),
-    ))
+    buffer = BytesIO()
+    pdf = Canvas(
+        buffer,
+        pagesize=(792, 612),
+        pageCompression=0,
+        pdfVersion=(1, 4),
+        invariant=1,
+    )
+    pdf.setTitle("SkillMatch Certificate of Participation")
+    pdf.setFillColor(paper)
+    pdf.rect(0, 0, 792, 612, stroke=0, fill=1)
 
+    # Keep the existing double border, campus-photo crop, and split-page layout.
+    pdf.setStrokeColor(accent)
+    pdf.setLineWidth(0.9)
+    pdf.rect(18, 18, 756, 576, stroke=1, fill=0)
+    pdf.rect(25, 25, 742, 562, stroke=1, fill=0)
+    photo_clip = pdf.beginPath()
+    photo_clip.moveTo(27, 27)
+    photo_clip.lineTo(27, 585)
+    photo_clip.lineTo(350, 585)
+    photo_clip.curveTo(369, 548, 380, 495, 381, 430)
+    photo_clip.curveTo(383, 352, 380, 280, 371, 210)
+    photo_clip.curveTo(361, 140, 347, 75, 337, 27)
+    photo_clip.lineTo(27, 27)
+    photo_clip.close()
+    pdf.saveState()
+    pdf.clipPath(photo_clip, stroke=0, fill=0)
+    pdf.drawImage(
+        ImageReader(BytesIO(dome_jpeg)),
+        image_x,
+        image_y,
+        width=image_width,
+        height=image_height,
+        preserveAspectRatio=False,
+    )
+    pdf.restoreState()
+
+    photo_edge = pdf.beginPath()
+    photo_edge.moveTo(27, 585)
+    photo_edge.lineTo(350, 585)
+    photo_edge.curveTo(369, 548, 380, 495, 381, 430)
+    photo_edge.curveTo(383, 352, 380, 280, 371, 210)
+    photo_edge.curveTo(361, 140, 347, 75, 337, 27)
+    photo_edge.lineTo(27, 27)
+    pdf.setStrokeColor(accent)
+    pdf.setLineWidth(1.5)
+    pdf.drawPath(photo_edge, stroke=1, fill=0)
+
+    photo_detail = pdf.beginPath()
+    photo_detail.moveTo(346, 582)
+    photo_detail.curveTo(365, 545, 375, 490, 377, 427)
+    photo_detail.curveTo(379, 352, 376, 280, 367, 210)
+    photo_detail.curveTo(358, 140, 344, 75, 333, 30)
+    pdf.setLineWidth(0.55)
+    pdf.drawPath(photo_detail, stroke=1, fill=0)
+
+    diamond = pdf.beginPath()
+    diamond.moveTo(576, 532)
+    diamond.lineTo(581, 537)
+    diamond.lineTo(586, 532)
+    diamond.lineTo(581, 527)
+    diamond.close()
+    pdf.setFillColor(accent)
+    pdf.drawPath(diamond, stroke=0, fill=1)
+    pdf.setLineWidth(0.9)
+    pdf.line(448, 534, 510, 534)
+    pdf.line(652, 534, 714, 534)
+
+    # Preserve the certificate's existing gold botanical ornament.
+    branch = pdf.beginPath()
+    branch.moveTo(366, 29)
+    branch.curveTo(380, 55, 390, 100, 414, 151)
+    pdf.setLineWidth(0.75)
+    pdf.drawPath(branch, stroke=1, fill=0)
+    leaf_curves = (
+        ((371, 47), (362, 45), (357, 49), (354, 55), (362, 59), (369, 56), (371, 47)),
+        ((378, 64), (388, 57), (396, 58), (400, 63), (394, 70), (386, 70), (378, 64)),
+        ((382, 81), (372, 77), (365, 81), (363, 87), (371, 92), (378, 89), (382, 81)),
+        ((388, 98), (398, 90), (407, 91), (411, 96), (404, 103), (396, 104), (388, 98)),
+        ((394, 116), (384, 112), (377, 116), (375, 122), (383, 127), (390, 124), (394, 116)),
+        ((401, 134), (411, 126), (419, 128), (422, 133), (415, 140), (407, 140), (401, 134)),
+    )
+    for start, c1, c2, end, c3, c4, finish in leaf_curves:
+        leaf = pdf.beginPath()
+        leaf.moveTo(*start)
+        leaf.curveTo(*c1, *c2, *end)
+        leaf.curveTo(*c3, *c4, *finish)
+        pdf.drawPath(leaf, stroke=1, fill=0)
+
+    _draw_certificate_text(
+        pdf, "MIT WORLD PEACE UNIVERSITY", 581, 566, 10, "DM-Sans-Bold", navy,
+    )
+    _draw_certificate_text(pdf, "PUNE", 581, 551, 7, "DM-Sans-Bold", navy)
+    _draw_certificate_text(
+        pdf, "CERTIFICATE OF", 581, 501, 20, "Fraunces-SemiBold", navy,
+    )
+    _draw_certificate_text(
+        pdf, "PARTICIPATION", 581, 472, 29, "Fraunces-Bold", navy,
+    )
+    _draw_certificate_text(
+        pdf, "PRESENTED TO", 581, 438, 8, "DM-Sans-Bold", navy,
+    )
+
+    volunteer_name = _volunteer_display_name(volunteer_name)
+    event_name = _event_display_name(event_name)
     text_center = 581
     text_width = 346
     name_lines, name_size = _fit_pdf_text(
-        volunteer_name, text_width, preferred_size=25, minimum_size=17, max_lines=2, bold=True,
+        volunteer_name,
+        text_width,
+        preferred_size=25,
+        minimum_size=17,
+        max_lines=2,
+        bold=True,
+        font_name="Fraunces-Bold",
     )
     name_y = 411
     for line in name_lines:
-        commands.append(_pdf_text_command(line, text_center, name_y, name_size, "F4", dark_green, centered=True))
+        _draw_certificate_text(
+            pdf, line, text_center, name_y, name_size, "Fraunces-Bold", navy,
+        )
         name_y -= name_size + 3
 
     event_label_y = 411 - len(name_lines) * (name_size + 3) - 6
-    commands.append(_pdf_text_command(
-        "FOR PARTICIPATION IN", text_center, event_label_y, 8, "F2", muted_green, centered=True,
-    ))
+    _draw_certificate_text(
+        pdf, "FOR PARTICIPATION IN", text_center, event_label_y, 8, "DM-Sans-Bold", navy,
+    )
     event_lines, event_size = _fit_pdf_text(
-        event_name, text_width, preferred_size=18, minimum_size=13, max_lines=2, bold=True,
+        event_name,
+        text_width,
+        preferred_size=18,
+        minimum_size=13,
+        max_lines=2,
+        bold=True,
+        font_name="Fraunces-Bold",
     )
     event_y = event_label_y - 24
     for line in event_lines:
-        commands.append(_pdf_text_command(
-            line, text_center, event_y, event_size, "F4", dark_green, centered=True,
-        ))
+        _draw_certificate_text(
+            pdf, line, text_center, event_y, event_size, "Fraunces-Bold", navy,
+        )
         event_y -= event_size + 3
 
-    details_y = event_label_y - 24 - len(event_lines) * (event_size + 3) - 10
+    details_y = event_y - 10
+    normalized_role = (
+        " ".join(volunteer_role.split())
+        if isinstance(volunteer_role, str) and volunteer_role.strip()
+        else None
+    )
+    if normalized_role:
+        role_lines, role_size = _fit_pdf_text(
+            f"as {normalized_role}",
+            text_width,
+            preferred_size=10,
+            minimum_size=8,
+            max_lines=1,
+            bold=True,
+            font_name="DM-Sans-Bold",
+        )
+        role_y = event_y - 3
+        for line in role_lines:
+            _draw_certificate_text(
+                pdf, line, text_center, role_y, role_size, "DM-Sans-Bold", navy,
+            )
+            role_y -= role_size + 2
+        details_y = role_y - 10
+
     event_date_text = _format_certificate_date(event_date) or "Not recorded"
     issue_date_text = _format_certificate_date(issue_date) or "Not recorded"
-    commands.append(_pdf_text_command(
-        f"Event date: {event_date_text}", text_center, details_y, 9, "F1", muted_ink, centered=True,
-    ))
-    commands.append(_pdf_text_command(
-        f"Issue date: {issue_date_text}", text_center, details_y - 16, 9, "F1", muted_ink, centered=True,
-    ))
-    commands.append(_pdf_text_command(
+    _draw_certificate_text(
+        pdf,
+        f"Event date: {event_date_text}",
+        text_center,
+        details_y,
+        9,
+        "DM-Sans",
+        muted_ink,
+    )
+    _draw_certificate_text(
+        pdf,
+        f"Issue date: {issue_date_text}",
+        text_center,
+        details_y - 16,
+        9,
+        "DM-Sans",
+        muted_ink,
+    )
+    _draw_certificate_text(
+        pdf,
         f"{format_decimal(hours)} volunteer hours",
-        text_center, details_y - 45, 14, "F2", dark_green, centered=True,
-    ))
-    commands.append(_pdf_text_command(
+        text_center,
+        details_y - 45,
+        14,
+        "DM-Sans-Bold",
+        navy,
+    )
+    _draw_certificate_text(
+        pdf,
         "Verification code available in your SkillMatch profile",
-        text_center, details_y - 76, 8, "F2", ink, centered=True,
-    ))
-    commands.append(_pdf_text_command(
-        "Verify at /verify", text_center, details_y - 94, 8, "F1", muted_ink, centered=True,
-    ))
-    commands.extend([
-        f"{gold[0]:.3f} {gold[1]:.3f} {gold[2]:.3f} RG "
-        "0.9 w 507 82 m 655 82 l S",
-        _pdf_text_command(
-            "Event Organizer Signature", text_center, 65, 8, "F1", muted_ink, centered=True,
-        ),
-    ])
-    stream = "\n".join(commands).encode("cp1252", errors="replace")
-    image_object = (
-        b"<< /Type /XObject /Subtype /Image /Width "
-        + str(dome_width).encode("ascii")
-        + b" /Height "
-        + str(dome_height).encode("ascii")
-        + b" /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length "
-        + str(len(dome_jpeg)).encode("ascii")
-        + b" >>\nstream\n"
-        + dome_jpeg
-        + b"\nendstream"
+        text_center,
+        details_y - 76,
+        8,
+        "DM-Sans-Bold",
+        navy,
     )
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Resources "
-        b"<< /Font << /F1 4 0 R /F2 5 0 R /F3 7 0 R /F4 8 0 R >> "
-        b"/XObject << /Dome 9 0 R >> >> /Contents 6 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
-        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
-        + stream + b"\nendstream",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>",
-        image_object,
-    ]
-    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = [0]
-    for index, body in enumerate(objects, start=1):
-        offsets.append(len(pdf))
-        pdf.extend(f"{index} 0 obj\n".encode("ascii"))
-        pdf.extend(body)
-        pdf.extend(b"\nendobj\n")
-    xref_offset = len(pdf)
-    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
-    pdf.extend(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
-    pdf.extend(
-        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\n"
-        f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    _draw_certificate_text(
+        pdf, "Verify at /verify", text_center, details_y - 94, 8, "DM-Sans", muted_ink,
     )
-    return bytes(pdf)
+
+    pdf.setStrokeColor(accent)
+    pdf.setLineWidth(0.9)
+    pdf.line(507, 82, 655, 82)
+    signature_name = (
+        " ".join(organizer_name.split())
+        if isinstance(organizer_name, str) and organizer_name.strip()
+        else "Event Organizer"
+    )
+    organizer_lines, organizer_size = _fit_pdf_text(
+        signature_name,
+        140,
+        preferred_size=9,
+        minimum_size=6,
+        max_lines=1,
+        bold=True,
+        font_name="DM-Sans-Bold",
+    )
+    _draw_certificate_text(
+        pdf,
+        organizer_lines[0],
+        text_center,
+        65,
+        organizer_size,
+        "DM-Sans-Bold",
+        navy,
+    )
+    _draw_certificate_text(
+        pdf,
+        "Event Organizer Signature",
+        text_center,
+        51,
+        7,
+        "DM-Sans",
+        muted_ink,
+    )
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _certificate_display_details(
+    record: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve role and organizer name for both new and legacy certificate records."""
+    role = record.get("volunteer_role")
+    if not isinstance(role, str) or not role.strip():
+        role = None
+    organizer_name = record.get("organizer_name")
+    if not isinstance(organizer_name, str) or not organizer_name.strip():
+        organizer_name = None
+
+    event_id = record.get("event_id")
+    username = record.get("username")
+    if (
+        "volunteer_role" not in record
+        and isinstance(event_id, str)
+        and isinstance(username, str)
+    ):
+        applications = load(APPLICATIONS_FILE)
+        event_applications = (
+            applications.get(event_id, {})
+            if isinstance(applications, Mapping)
+            else {}
+        )
+        application = (
+            event_applications.get(username, {})
+            if isinstance(event_applications, Mapping)
+            else {}
+        )
+        candidate = application.get("role") if isinstance(application, Mapping) else None
+        role = candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
+
+    if (
+        organizer_name is None
+        and isinstance(event_id, str)
+    ):
+        events = load(EVENTS_FILE)
+        event = events.get(event_id, {}) if isinstance(events, Mapping) else {}
+        organizer_id = event.get("organizer") if isinstance(event, Mapping) else None
+        if isinstance(organizer_id, str) and organizer_id.strip():
+            users = load(USERS_FILE)
+            organizer = users.get(organizer_id) if isinstance(users, Mapping) else None
+            candidate = (
+                organizer.get("name")
+                if isinstance(organizer, Mapping)
+                else None
+            )
+            organizer_name = (
+                candidate.strip()
+                if isinstance(candidate, str) and candidate.strip()
+                else organizer_id
+            )
+    return role, organizer_name
 
 
 def render_certificate_pdf(record: Mapping[str, Any]) -> bytes | None:
@@ -410,6 +604,7 @@ def render_certificate_pdf(record: Mapping[str, Any]) -> bytes | None:
     event_name = record.get("event_name")
     if not isinstance(event_name, str) or not event_name.strip():
         event_name = record.get("event_id", "Campus event")
+    volunteer_role, organizer_name = _certificate_display_details(record)
 
     return _render_certificate_pdf(
         str(volunteer_name),
@@ -417,6 +612,8 @@ def render_certificate_pdf(record: Mapping[str, Any]) -> bytes | None:
         hours,
         event_date=record.get("event_date"),
         issue_date=record.get("generated_at"),
+        volunteer_role=volunteer_role,
+        organizer_name=organizer_name,
     )
 
 
@@ -470,6 +667,23 @@ def generate_certificate(
         if user.get("role") != "Student Volunteer":
             return False, "Certificates are issued only to student volunteers."
 
+        organizer_id = event.get("organizer")
+        organizer = users.get(organizer_id) if isinstance(organizer_id, str) else None
+        organizer_name = (
+            organizer.get("name")
+            if isinstance(organizer, Mapping)
+            and isinstance(organizer.get("name"), str)
+            and organizer.get("name").strip()
+            else organizer_id
+            if isinstance(organizer_id, str) and organizer_id.strip()
+            else "Event Organizer"
+        )
+        assigned_role = application.get("role")
+        volunteer_role = (
+            assigned_role.strip()
+            if isinstance(assigned_role, str) and assigned_role.strip()
+            else None
+        )
         event_date = _event_date_value(event)
         certificates = _load_object(CERTIFICATES_FILE, "keyed by verification code")
         record = _certificate_for(event_id, username)
@@ -485,6 +699,8 @@ def generate_certificate(
                 "event_name": event.get("name", event_id),
                 "event_date": event_date,
                 "volunteer_name": user.get("name", username),
+                "organizer_name": organizer_name,
+                "volunteer_role": volunteer_role,
                 "hours": application.get("hours", 0),
                 "notes": application.get("notes", ""),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -496,6 +712,8 @@ def generate_certificate(
         record.update({
             "event_name": event.get("name", event_id),
             "volunteer_name": user.get("name", username),
+            "organizer_name": organizer_name,
+            "volunteer_role": volunteer_role,
             "hours": application.get("hours", 0),
             "notes": application.get("notes", ""),
         })
