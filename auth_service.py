@@ -1,6 +1,7 @@
 """Account and skill-matching services backed by the shared JSON store."""
 
 from collections.abc import Mapping
+import re
 from typing import Any
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -10,6 +11,8 @@ from data_store import load, save
 
 USERS_FILE = "users.json"
 ALLOWED_ROLES = {"Organizer", "Student Volunteer"}
+PASSWORD_PATTERN = r"(?=.*[0-9])(?=.*[^A-Za-z0-9\s]).{8,1024}"
+_PASSWORD_RE = re.compile(rf"^{PASSWORD_PATTERN}$")
 
 
 def _validated_skills(skills: Any) -> dict[str, int] | None:
@@ -54,8 +57,13 @@ def register_user(
         return False, "Enter a name of 1 to 100 characters."
     if role not in ALLOWED_ROLES:
         return False, "Choose Organizer or Student Volunteer."
-    if not isinstance(password, str) or not 8 <= len(password) <= 1024:
-        return False, "Use a password between 8 and 1024 characters."
+    if not isinstance(password, str) or len(password) > 1024:
+        return False, "Use a password of 8 to 1024 characters."
+    if not _PASSWORD_RE.fullmatch(password):
+        return False, (
+            "Password must be at least 8 characters and include at least "
+            "one digit and one special character."
+        )
 
     if role == "Organizer":
         dept = ""
