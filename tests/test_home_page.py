@@ -51,8 +51,6 @@ class HomePageTests(unittest.TestCase):
     def test_shared_workspace_and_interior_pages_use_homepage_theme(self):
         css = Path("static/style.css").read_text(encoding="utf-8")
         for rule in (
-            ".sidebar > a",
-            "background:\n    linear-gradient(155deg, rgb(255 255 255 / 4%), transparent 48%),\n    var(--navy);",
             ".section-heading h1,\n.page-heading h1",
             ".certificate-verify-form",
             ".profile-panel",
@@ -61,8 +59,10 @@ class HomePageTests(unittest.TestCase):
             self.assertIn(rule, css)
 
         base_template = Path("templates/base.html").read_text(encoding="utf-8")
-        self.assertIn('class="sidebar"', base_template)
+        self.assertNotIn('class="sidebar"', base_template)
         self.assertIn('class="top-nav top-nav--desktop"', base_template)
+        self.assertIn('url_for(\'dashboard.home\')', base_template)
+        self.assertIn('url_for(\'notifications.home\')', base_template)
 
 
 if __name__ == "__main__":
