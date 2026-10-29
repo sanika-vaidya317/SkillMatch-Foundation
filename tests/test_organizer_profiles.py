@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import auth_service
+import certificate_service
 import data_store
 from app import app
 
@@ -33,7 +34,7 @@ class OrganizerProfileTests(unittest.TestCase):
         response = self.client.post("/register", data={
             "username": "organizer",
             "name": "Organizer One",
-            "password": "safe-password",
+            "password": "safe-pass1",
             "role": "Organizer",
             "dept": "Ignore this",
             "skills": "not a valid skill list",
@@ -69,9 +70,45 @@ class OrganizerProfileTests(unittest.TestCase):
         self.assertNotIn(b'name="dept"', organizer_page.data)
         self.assertNotIn(b'name="skills"', organizer_page.data)
 
+    def test_registration_password_requires_digit_and_special_character(self):
+        response = self.client.get("/register")
+        self.assertIn(b'pattern="(?=.*[0-9])(?=.*[^A-Za-z0-9\\s]).{8,1024}"', response.data)
+        rejected = self.client.post("/register", data={
+            "username": "bad-password",
+            "name": "Student One",
+            "password": "password1",
+            "role": "Organizer",
+            "csrf_token": self.csrf,
+        })
+        self.assertEqual(rejected.status_code, 200)
+        self.assertIn(b"one digit and one special character", rejected.data)
+        self.assertNotIn("bad-password", data_store.load("users.json"))
+
+        for password in ("password1", "safe-password", "short1!"):
+            success, message = auth_service.register_user(
+                "student",
+                password,
+                "Student Volunteer",
+                "Student One",
+                dept="CSE",
+                skills={"Python": 2},
+            )
+            self.assertFalse(success)
+            self.assertIn("digit", message)
+            self.assertIn("special character", message)
+        success, message = auth_service.register_user(
+            "student",
+            "safe-pass1",
+            "Student Volunteer",
+            "Student One",
+            dept="CSE",
+            skills={"Python": 2},
+        )
+        self.assertTrue(success, message)
+
     def test_organizer_service_normalizes_unused_profile_fields(self):
         success, message = auth_service.register_user(
-            "organizer", "safe-password", "Organizer", "Organizer One",
+            "organizer", "safe-pass1", "Organizer", "Organizer One",
             dept="Anything", skills={"Invalid": True},
         )
         self.assertTrue(success, message)
@@ -86,17 +123,66 @@ class OrganizerProfileTests(unittest.TestCase):
             ("CSE", None, "skill"),
         ):
             success, message = auth_service.register_user(
-                "student", "safe-password", "Student Volunteer", "Student One",
+                "student", "safe-pass1", "Student Volunteer", "Student One",
                 dept=dept, skills=skills,
             )
             self.assertFalse(success)
             self.assertIn(expected, message)
         self.assertEqual(data_store.load("users.json"), {})
         success, message = auth_service.register_user(
-            "student", "safe-password", "Student Volunteer", "Student One",
+            "student", "safe-pass1", "Student Volunteer", "Student One",
             dept="CSE", skills={"Python": 2},
         )
         self.assertTrue(success, message)
+
+    def test_volunteer_badges_use_completed_hours_and_appear_on_profile(self):
+        data_store.save("users.json", {
+            "student": {
+                "name": "Student One",
+                "role": "Student Volunteer",
+                "dept": "CSE",
+                "skills": {"Python": 2},
+            },
+        })
+        for hours, expected_badge in (
+            (0, None),
+            (0.5, "Copper"),
+            (9.99, "Copper"),
+            (10, "Silver"),
+            (24.5, "Silver"),
+            (25, "Gold"),
+            (99.5, "Gold"),
+            (100, "Diamond"),
+        ):
+            with self.subTest(hours=hours):
+                data_store.save("events.json", {
+                    "completed": {"status": "completed"},
+                    "in_progress": {"status": "open"},
+                })
+                data_store.save("applications.json", {
+                    "completed": {
+                        "student": {"status": "accepted", "hours": hours},
+                    },
+                    "in_progress": {
+                        "student": {"status": "accepted", "hours": 200},
+                    },
+                })
+                badge = certificate_service.get_volunteer_badge("student")
+                self.assertEqual(
+                    badge["name"] if badge else None,
+                    expected_badge,
+                )
+
+        data_store.save("events.json", {"completed": {"status": "completed"}})
+        data_store.save("applications.json", {
+            "completed": {"student": {"status": "accepted", "hours": 10}},
+        })
+        with self.client.session_transaction() as session:
+            session["username"] = "student"
+        profile = self.client.get("/profile")
+        self.assertEqual(profile.status_code, 200)
+        self.assertIn(b"Silver badge", profile.data)
+        self.assertIn(b"10 completed volunteer hours", profile.data)
 
     def test_organizer_profile_save_keeps_other_record_fields(self):
         data_store.save("users.json", {"organizer": {
