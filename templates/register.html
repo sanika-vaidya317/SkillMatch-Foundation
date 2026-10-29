@@ -55,8 +55,10 @@
       <p>
         <label for="password">Password</label><br>
         <input id="password" name="password" type="password"
-               autocomplete="new-password" required minlength="8" maxlength="1024">
-        <br><small>Use at least 8 characters.</small>
+               autocomplete="new-password" required minlength="8" maxlength="1024"
+               pattern="{{ password_pattern }}"
+               title="Use at least 8 characters, including a digit and a special character.">
+        <br><small>Use at least 8 characters, including one digit and one special character.</small>
       </p>
       <button class="button button--primary" type="submit">Create account</button>
     </form>
