@@ -22,9 +22,7 @@ from flask import (
 )
 
 from auth_service import login_user, register_user
-from certificate_service import get_user_certificates
 from data_store import load, save
-from notification_service import get_unread_notification_count
 
 
 USERS_FILE = "users.json"
@@ -84,19 +82,9 @@ def _inject_auth_context():
     if not token:
         token = secrets.token_urlsafe(32)
         session["csrf_token"] = token
-    current_user = getattr(g, "current_user", None)
-    notification_unread_count = 0
-    if (
-        isinstance(current_user, dict)
-        and current_user.get("role") in {"Organizer", "Student Volunteer"}
-    ):
-        notification_unread_count = get_unread_notification_count(
-            current_user["username"]
-        )
     return {
-        "current_user": current_user,
+        "current_user": getattr(g, "current_user", None),
         "csrf_token": token,
-        "notification_unread_count": notification_unread_count,
     }
 
 
@@ -236,19 +224,6 @@ def _profile_context(editing: bool, form_data: dict | None = None) -> dict:
     }
     if form_data:
         default_form_data.update(form_data)
-    certificate_notifications = []
-    certificate_notification_error = None
-    if not editing and user.get("role") == "Student Volunteer":
-        try:
-            certificate_notifications = [
-                record
-                for record in get_user_certificates(user["username"])
-                if isinstance(record.get("verification_code"), str)
-                and len(record["verification_code"]) == 10
-                and record["verification_code"].isalnum()
-            ]
-        except ValueError as error:
-            certificate_notification_error = str(error)
     return {
         "user": user,
         "is_organizer": user.get("role") == "Organizer",
@@ -256,8 +231,6 @@ def _profile_context(editing: bool, form_data: dict | None = None) -> dict:
         "editing": editing,
         "form_data": default_form_data,
         "skill_items": sorted(skills.items(), key=lambda item: item[0].casefold()),
-        "certificate_notifications": certificate_notifications,
-        "certificate_notification_error": certificate_notification_error,
     }
 
 
