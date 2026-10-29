@@ -77,6 +77,32 @@
         </section>
       {% endif %}
 
+      {% if user.role == "Student Volunteer" %}
+        <section class="volunteer-recognition" aria-labelledby="volunteer-recognition-title">
+          <h2 id="volunteer-recognition-title">Volunteer badges</h2>
+          {% if volunteer_badge_error %}
+            {{ toast(volunteer_badge_error, "error") }}
+          {% elif volunteer_badge %}
+            <article class="volunteer-badge volunteer-badge--{{ volunteer_badge.slug }}">
+              <span class="volunteer-badge__mark" aria-hidden="true">◆</span>
+              <div>
+                <strong>{{ volunteer_badge.name }} badge</strong>
+                <p>{{ volunteer_badge.total_hours|format_decimal }} completed volunteer hours</p>
+                {% if volunteer_badge.next_badge %}
+                  <small>
+                    {{ volunteer_badge.hours_until_next|format_decimal }} more hours to {{ volunteer_badge.next_badge }}
+                  </small>
+                {% else %}
+                  <small>You’ve reached the highest volunteer badge tier.</small>
+                {% endif %}
+              </div>
+            </article>
+          {% else %}
+            <p>Complete an event to earn your first Copper badge.</p>
+          {% endif %}
+        </section>
+      {% endif %}
+
       <p><a class="button button--primary" href="{{ url_for('auth.edit_profile') }}">Edit profile</a></p>
       <form method="post"
             action="{{ url_for('auth.logout') }}"
