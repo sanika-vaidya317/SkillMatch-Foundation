@@ -1,21 +1,14 @@
 """Organizer dashboard and volunteer-review operations backed by JSON storage."""
 
 from collections.abc import Mapping
-import calendar
 import math
 from datetime import date, datetime, time as time_value, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from data_store import load, save
-from event_service import (
-    EVENTS_FILE as EVENT_RECORDS_FILE,
-    create_event,
-    get_event_eligibility_reason,
-    validate_event_data,
-)
+from event_service import EVENTS_FILE as EVENT_RECORDS_FILE, create_event, validate_event_data
 from formatting import format_decimal
-from notification_service import add_notifications
 
 
 EVENTS_FILE = "events.json"
@@ -136,37 +129,6 @@ def get_organizer_events(organizer_id: str) -> list[dict[str, Any]]:
             else "",
         ),
     )
-
-
-def dashboard_cards(username: str) -> list[dict[str, Any]]:
-    """Build display-ready event summaries for one organizer."""
-    cards = []
-    for item in get_organizer_events(username):
-        event = item["event"]
-        event_date = event_calendar_date(event)
-        status = event.get("status")
-        if not isinstance(status, str) or not status.strip():
-            raise ValueError(f"Event '{item['event_id']}' must have a status.")
-
-        counts = {
-            "pending": item["pending_count"],
-            "accepted": item["accepted_count"],
-            "rejected": item["rejected_count"],
-        }
-        cards.append({
-            "event_id": item["event_id"],
-            "event": event,
-            "day": event_date.strftime("%d") if event_date else "",
-            "month": calendar.month_abbr[event_date.month] if event_date else "",
-            "status": status,
-            "seats_filled": counts["accepted"],
-            "total_seats": event["slots_needed"],
-            "applicant_counts": [
-                {"status": key, "label": key.title(), "count": counts[key]}
-                for key in ("pending", "accepted", "rejected")
-            ],
-        })
-    return cards
 
 
 def _event_form_payload(organizer_id: str, form: Mapping[str, Any]) -> dict[str, Any]:
@@ -302,35 +264,7 @@ def organizer_event_form_values(event: Mapping[str, Any] | None = None) -> dict[
 
 def create_organizer_event(organizer_id: str, form: Mapping[str, Any]) -> str:
     """Validate and create an event owned by the signed-in organizer."""
-    payload = _event_form_payload(organizer_id, form)
-    users = load(USERS_FILE)
-    if not isinstance(users, dict):
-        raise ValueError("users.json must contain an object keyed by username.")
-    event_id = create_event(payload)
-    event_name = payload["name"]
-    add_notifications(
-        [organizer_id],
-        kind="event_posted",
-        title="Event posted",
-        message=f"Your event, {event_name}, is now open for applications.",
-        event_id=event_id,
-    )
-    volunteer_ids = [
-        username
-        for username, user in users.items()
-        if isinstance(username, str)
-        and isinstance(user, Mapping)
-        and user.get("role") == "Student Volunteer"
-    ]
-    if volunteer_ids:
-        add_notifications(
-            volunteer_ids,
-            kind="event_posted",
-            title="New event posted",
-            message=f"{event_name} is open. Review the event details and apply if interested.",
-            event_id=event_id,
-        )
-    return event_id
+    return create_event(_event_form_payload(organizer_id, form))
 
 
 def get_organizer_event(organizer_id: str, event_id: str) -> dict[str, Any]:
@@ -339,56 +273,11 @@ def get_organizer_event(organizer_id: str, event_id: str) -> dict[str, Any]:
     return event
 
 
-def compare_applicant_skills(
-    applicant_skills: Mapping[str, Any],
-    required_skills: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Compare required event skills to applicant ratings without case sensitivity."""
-    if not isinstance(applicant_skills, Mapping):
-        raise ValueError("Applicant skills must be an object.")
-    if not isinstance(required_skills, Mapping):
-        raise ValueError("Required skills must be an object.")
-
-    applicant_ratings: dict[str, int] = {}
-    for name, rating in applicant_skills.items():
-        if (
-            not isinstance(name, str)
-            or not name.strip()
-            or not isinstance(rating, int)
-            or isinstance(rating, bool)
-            or rating < 0
-        ):
-            raise ValueError("Applicant skill names and ratings are invalid.")
-        applicant_ratings[name.strip().casefold()] = rating
-
-    comparisons = []
-    for name, required_rating in required_skills.items():
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Required skill names must be non-empty strings.")
-        if (
-            not isinstance(required_rating, int)
-            or isinstance(required_rating, bool)
-            or required_rating < 0
-        ):
-            raise ValueError("Required skill ratings must be non-negative integers.")
-        applicant_rating = applicant_ratings.get(name.strip().casefold())
-        comparisons.append({
-            "name": name.strip(),
-            "applicant_rating": applicant_rating,
-            "required_rating": required_rating,
-            "met": (
-                applicant_rating is not None
-                and applicant_rating >= required_rating
-            ),
-        })
-    return comparisons
-
-
 def update_organizer_event(
     organizer_id: str, event_id: str, form: Mapping[str, Any]
 ) -> None:
     """Update an owned event while preserving its ID, status, and creation time."""
-    event, events, event_applications = _load_owned_event(organizer_id, event_id)
+    event, events, _event_applications = _load_owned_event(organizer_id, event_id)
     payload = validate_event_data(_event_form_payload(organizer_id, form))
     payload["status"] = event.get("status", "open")
     if payload["status"] not in ("open", "completed"):
@@ -396,32 +285,8 @@ def update_organizer_event(
     payload["created_at"] = event.get("created_at")
     updated_event = dict(event)
     updated_event.update(payload)
-    details_fields = (
-        "name", "description", "required_skills", "slots_needed", "department",
-        "type", "location", "date", "starts_at", "ends_at", "duration_hours",
-    )
-    details_changed = any(
-        event.get(field) != updated_event.get(field) for field in details_fields
-    )
     events[event_id] = updated_event
     save(EVENT_RECORDS_FILE, events)
-    if details_changed:
-        recipients = [organizer_id]
-        recipients.extend(
-            applicant_id
-            for applicant_id in event_applications
-            if isinstance(applicant_id, str)
-        )
-        add_notifications(
-            recipients,
-            kind="event_details_updated",
-            title="Event details updated",
-            message=(
-                f"The details for {updated_event['name']} changed. "
-                "Open the event to see the latest schedule, venue, and requirements."
-            ),
-            event_id=event_id,
-        )
 
 
 def get_event_applicants(organizer_id: str, event_id: str) -> dict[str, Any]:
@@ -430,9 +295,6 @@ def get_event_applicants(organizer_id: str, event_id: str) -> dict[str, Any]:
     users = load(USERS_FILE)
     if not isinstance(users, dict):
         raise ValueError("users.json must contain an object keyed by username.")
-    required_skills = event.get("required_skills", {})
-    if not isinstance(required_skills, Mapping):
-        raise ValueError(f"Event '{event_id}' must have required_skills as an object.")
 
     applicants = []
     for volunteer_id, application in event_applications.items():
@@ -468,7 +330,6 @@ def get_event_applicants(organizer_id: str, event_id: str) -> dict[str, Any]:
             "name": user.get("name") if isinstance(user.get("name"), str) else volunteer_id,
             "department": user.get("dept") if isinstance(user.get("dept"), str) else None,
             "skill_items": sorted(skill_items, key=lambda item: item[0].casefold()),
-            "skill_matches": compare_applicant_skills(skills, required_skills),
             "status": status,
             "role": role,
             "attended": attended,
@@ -544,23 +405,6 @@ def update_application_status(
     event_applications[volunteer_id] = application
     applications[event_id] = event_applications
     save(APPLICATIONS_FILE, applications)
-    if current_status != new_status:
-        event_name = event.get("name", "the event")
-        if new_status == "accepted":
-            title = "Application accepted"
-            message = f"Your application for {event_name} was accepted. Your assigned role is {role}."
-            kind = "application_accepted"
-        else:
-            title = "Application rejected"
-            message = f"Your application for {event_name} was not accepted."
-            kind = "application_rejected"
-        add_notifications(
-            [volunteer_id],
-            kind=kind,
-            title=title,
-            message=message,
-            event_id=event_id,
-        )
 
 
 def mark_attendance(
