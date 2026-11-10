@@ -3,6 +3,7 @@
 from flask import Blueprint, abort, flash, g, redirect, render_template, url_for
 
 from auth_routes import _login_required, _require_csrf
+from data_store import load
 from notification_service import (
     get_user_notifications,
     mark_all_notifications_read,
@@ -26,6 +27,13 @@ def home():
     """Show the signed-in organizer's or volunteer's event notifications."""
     user = _supported_account()
     notifications = get_user_notifications(user["username"])
+    events = load("events.json")
+    if not isinstance(events, dict):
+        raise ValueError("events.json must contain an object keyed by event ID.")
+    notifications = [
+        {**notice, "event": events.get(notice.get("event_id"))}
+        for notice in notifications
+    ]
     return render_template("notifications.html", notifications=notifications)
 
 
