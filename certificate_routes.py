@@ -12,8 +12,10 @@ from certificate_service import (
     get_organizer_events,
     get_user_certificates,
     render_certificate_pdf,
+    render_verified_certificate_pdf,
     verify_certificate,
 )
+from data_store import load
 
 
 certificates_bp = Blueprint("certificates", __name__)
@@ -53,6 +55,19 @@ def home():
     if current_user.get("role") == "Student Volunteer":
         try:
             certificates = get_user_certificates(current_user["username"])
+            event_records = load("events.json")
+            if not isinstance(event_records, dict):
+                raise ValueError("events.json must contain an object keyed by event ID.")
+            certificates = [
+                {
+                    **record,
+                    "event": event_records.get(record.get("event_id"), {
+                        "name": record.get("event_name"),
+                        "category": record.get("category", "Community Service"),
+                    }),
+                }
+                for record in certificates
+            ]
         except ValueError as error:
             return render_template(
                 "certificates.html", role="Student Volunteer", events=[], certificates=[],
@@ -136,3 +151,18 @@ def verify():
         certificate=result,
         searched=searched,
     )
+
+
+@certificates_bp.get("/verify/<verification_code>/certificate.pdf")
+def verified_certificate_preview(verification_code):
+    """Public inline copy matches the owner's PDF; verification codes stay off the PDF."""
+    pdf = render_verified_certificate_pdf(verification_code)
+    if pdf is None:
+        abort(404)
+    response = send_file(
+        BytesIO(pdf), mimetype="application/pdf", as_attachment=False,
+        download_name="SkillMatch-certificate.pdf",
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return response
